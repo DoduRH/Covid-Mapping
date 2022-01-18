@@ -1,0 +1,13 @@
+# Downloaded data
+data/
+# HTML files of plots
+HTML/
+# Individual frames as pngs
+images/
+# LTLA boundary data
+LTLA/
+# ONS Population data
+Population/
+
+__pycache__/
+.vscode/
