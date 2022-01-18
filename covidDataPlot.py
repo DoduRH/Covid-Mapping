@@ -19,7 +19,7 @@ from tqdm import tqdm
 # %%
 # Load data
 population = pd.read_csv("Population/ONS-population_2021-08-05.csv")
-pop_lookup = pd.Series()
+pop_lookup = pd.Series(dtype=int)
 for i, group in population.groupby("areaCode"):
     pop_lookup[i] = group[group.category == 'ALL'].population.values[0]
 
@@ -27,13 +27,13 @@ with open("data/ltla_2021-12-22.json") as f:
     data = json.load(f)
 df = pd.DataFrame(data['body'])
 # Orkney Islands not on 22nd dec 2021, assumed to be 0
-df.loc[len(df)] = {
-    "areaType": "ltla",
-    "areaCode": "S12000023",
-    "areaName": "Orkney Islands",
-    "date": "2021-12-22",
-    "newCasesByPublishDate": "0",
-}
+# df.loc[len(df)] = {
+#     "areaType": "ltla",
+#     "areaCode": "S12000023",
+#     "areaName": "Orkney Islands",
+#     "date": "2021-12-22",
+#     "newCasesByPublishDate": "0",
+# }
 boundaries = shapefile.Reader("LTLA/ltla_uk.shp")
 
 # %%
@@ -50,16 +50,15 @@ for i, group in tqdm(df.groupby("date")):
         .rename({'newCasesByPublishDate': datetime(*[int(x) for x in i.split("-")])})
     )
 
-cases_df = pd.concat(dfs)
-cases_df.head()
+cases_df = pd.concat(dfs).fillna(0)
+print(cases_df.shape)
 
 # %%
 # Plot boundaries
 PER_HUNDRED = False
 DIF = True
 
-
-place_map = {
+placename_map = {
     "Buckinghamshire": "South Bucks",
     "Na h-Eileanan Siar": "Comhairle nan Eilean Siar",
     'Cornwall': "Cornwall and Isles of Scilly",
@@ -68,58 +67,104 @@ place_map = {
     'Hackney': "Hackney and City of London",
 }
 
+# Map of place codes
+placecode_map = {
+    "E06000060": "E07000006",
+    # "Na h-Eileanan Siar": "Comhairle nan Eilean Siar",
+    'E06000053': "E06000052",
+    'E09000001': "E09000012",
+}
 
-current_day = datetime(2021, 12, 21)
-date_str = current_day.strftime("%Y-%m-%d")
-date_yest = (current_day - timedelta(days=1))
-date_yest_str = date_yest.strftime("%Y-%m-%d")
-current_df = df[np.logical_or(df.date == date_str, df.date == date_yest_str)]
-expected = 2
+
+date_current = datetime(2021, 12, 15)
+date_yest = date_current - timedelta(days=1)
 
 if DIF:
-    d = (current_df[current_df.date == date_yest_str].newCasesByPublishDate.values - current_df[current_df.date == date_str].newCasesByPublishDate.values)
-    vmin = d.min()
-    vmax = d.max()
+    # Calculate the rate of change of cases
+    d = cases_df.loc[date_current] - cases_df.loc[date_yest]
+    if d.min() < 0:
+        vmin = -np.abs([d.min(), d.max()]).max()
+    else:
+        vmin = 0
+    vmax = np.abs([d.min(), d.max()]).max()
+    print(f"vmin: {vmin}, vmax: {vmax}")
 else:
     vmin = 0
-    vmax = current_df.newCasesByPublishDate.values.max()
+    vmax = cases_df.loc[date_current].max()
 
+# Generate color map
 norm = colors.Normalize(vmin=vmin, vmax=vmax)
-cmap = cm.jet
+cmap = cm.coolwarm
 
 m = cm.ScalarMappable(norm=norm, cmap=cmap)
 
+def get_color_strings(vals):
+    # tuple(r,g,b,a) to string 'rgba(r,g,b,a)'
+    return [f"rgba({r},{g},{b},{a})" for r, g, b, a in vals]
+
+scatters = []
 for zone in tqdm(boundaries.shapeRecords()):
+    # Extract ltla name and code
     ltla_code = zone.record[1]
+    ltla_code = placecode_map.get(ltla_code, ltla_code)
     ltla_name = zone.record[2]
-    ltla_name = place_map.get(ltla_name, ltla_name)
+    ltla_name = placename_map.get(ltla_name, ltla_name)
 
-    cases = current_df[current_df.areaName == ltla_name]
+    # Get case count
+    cases = cases_df[ltla_code] # all of the cases in this area since start
     
-    days = 0
-    while len(cases) == 0:
-        days += 1
-        print(f"No cases for {ltla_name} on {date_str}")
-        date = (current_day - timedelta(days=days)).strftime("%Y-%m-%d")
-        cases = df[np.logical_and(current_df.areaName == ltla_name, df.date == date)]
-    
-    if len(cases) > expected:
-        cases = cases[cases.areaName == ltla_name]
-    
+    # Get number to show (rate of change or absolute)
     if DIF:
-        case_num = (cases[cases.date == date_yest_str].newCasesByPublishDate.values - cases[cases.date == date_str].newCasesByPublishDate.values)[0]
+        case_num = cases_df[ltla_code][date_current] - cases_df[ltla_code][date_yest]
     else:
-        case_num = cases.newCasesByPublishDate.values[0]
+        case_num = cases_df[ltla_code][date_current]
 
+    # Divide by population if desired
     if PER_HUNDRED:
         case_num = case_num / pop_lookup[ltla_code] * 100_000
 
+    # Get color
     col = m.to_rgba(case_num)
     
+    # Get shape points and plot
     points = np.array(zone.shape.points)
-    plt.fill(points[:,0], points[:,1], c=col, linewidth=1)
+    scatters.append(
+        go.Scatter(
+            x=points[:,0], 
+            y=points[:,1],
+            line=dict(
+                width=0.1,
+                color="rgb(0,0,0)",
+            ),
+            fill="toself", 
+            fillcolor=f"rgba({','.join([str(x) for x in col])})", 
+            name=f"{ltla_name}\n{case_num:.0f}",
+        )
+    )
 
-    cases_num = cases.newCasesByPublishDate.values[0]
+# Generate figure
+fig = go.Figure(scatters)
+fig.update_yaxes(
+    scaleanchor="x",
+    scaleratio=1,
+)
+fig.update_layout(
+    showlegend=False,
+)
+colorbar_trace  = go.Scatter(
+    x=[None],
+    y=[None],
+    mode='markers',
+    marker=dict(
+        colorscale=get_color_strings(m.to_rgba(np.linspace(vmin, vmax, 100))),
+        showscale=True,
+        cmin=-5,
+        cmax=5,
+        colorbar=dict(thickness=5, tickvals=[-5, 5], ticktext=['Low', 'High'], outlinewidth=0)
+    ),
+    hoverinfo='none'
+)
+fig.add_trace(colorbar_trace)
 
-plt.gca().set_aspect('equal', adjustable='box')
-plt.show()
+fig.show()
+print("Done")
