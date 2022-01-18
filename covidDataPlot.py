@@ -5,16 +5,14 @@ url = "https://api.coronavirus.data.gov.uk/v2/data?areaType=ltla&metric=newCases
 import pandas as pd
 import numpy as np
 
-import plotly.express as px
 import plotly.graph_objects as go
 
-import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import matplotlib.colors as colors
 import json
-import shapefile
 from datetime import datetime, timedelta
 from tqdm import tqdm
+import pathlib
 
 # %%
 # Load data
@@ -26,23 +24,15 @@ for i, group in population.groupby("areaCode"):
 with open("data/ltla_2021-12-22.json") as f:
     data = json.load(f)
 df = pd.DataFrame(data['body'])
-# Orkney Islands not on 22nd dec 2021, assumed to be 0
-# df.loc[len(df)] = {
-#     "areaType": "ltla",
-#     "areaCode": "S12000023",
-#     "areaName": "Orkney Islands",
-#     "date": "2021-12-22",
-#     "newCasesByPublishDate": "0",
-# }
-boundaries = shapefile.Reader("LTLA/ltla_uk.shp")
+
+boundaries = pd.read_feather("LTLA/Transformed/ltla_uk.feather").set_index("areaCode")
+
 
 # %%
 # Transform data
-# cases_df = pd.DataFrame(columns=df.areaCode.unique())
-
 dfs = []
 
-for i, group in tqdm(df.groupby("date")):
+for i, group in tqdm(df.groupby("date"), desc="Transforming case data"):
     dfs.append(
         group
         .set_index("areaCode")
@@ -70,80 +60,89 @@ placename_map = {
 # Map of place codes
 placecode_map = {
     "E06000060": "E07000006",
-    # "Na h-Eileanan Siar": "Comhairle nan Eilean Siar",
     'E06000053': "E06000052",
     'E09000001': "E09000012",
 }
 
 
+def get_color_string(val):
+    # Get string 'rgba(r, g, b, a)' from tuple(r, g, b, a)
+    val = val[0]
+    return f"rgba({val[0]},{val[1]},{val[2]},{val[3]})"
+
+def get_color_strings(vals):
+    # Get list of strings 'rgba(r, g, b, a)' from list of tuples(r, g, b, a)
+    return [get_color_string(val) for val in vals]
+
+def get_name_from_code(code):
+    # Get ltla readable name from area code
+    return boundaries.loc[code].areaName
+
+# Fix dates
 date_current = datetime(2021, 12, 15)
 date_yest = date_current - timedelta(days=1)
 
-if DIF:
-    # Calculate the rate of change of cases
-    d = cases_df.loc[date_current] - cases_df.loc[date_yest]
-    if d.min() < 0:
-        vmin = -np.abs([d.min(), d.max()]).max()
-    else:
-        vmin = 0
-    vmax = np.abs([d.min(), d.max()]).max()
-    print(f"vmin: {vmin}, vmax: {vmax}")
-else:
-    vmin = 0
-    vmax = cases_df.loc[date_current].max()
-
-# Generate color map
-norm = colors.Normalize(vmin=vmin, vmax=vmax)
-cmap = cm.coolwarm
-
-m = cm.ScalarMappable(norm=norm, cmap=cmap)
-
-def get_color_strings(vals):
-    # tuple(r,g,b,a) to string 'rgba(r,g,b,a)'
-    return [f"rgba({r},{g},{b},{a})" for r, g, b, a in vals]
-
-scatters = []
-for zone in tqdm(boundaries.shapeRecords()):
-    # Extract ltla name and code
-    ltla_code = zone.record[1]
-    ltla_code = placecode_map.get(ltla_code, ltla_code)
-    ltla_name = zone.record[2]
-    ltla_name = placename_map.get(ltla_name, ltla_name)
-
-    # Get case count
-    cases = cases_df[ltla_code] # all of the cases in this area since start
-    
-    # Get number to show (rate of change or absolute)
+scatters = {}
+# Place all of the boundaries traces
+for ltla_code, (x, y, ltla_name) in tqdm(boundaries.iterrows(), total=boundaries.shape[0], desc="Generating boundaries"):
     if DIF:
         case_num = cases_df[ltla_code][date_current] - cases_df[ltla_code][date_yest]
     else:
         case_num = cases_df[ltla_code][date_current]
 
-    # Divide by population if desired
     if PER_HUNDRED:
         case_num = case_num / pop_lookup[ltla_code] * 100_000
 
-    # Get color
-    col = m.to_rgba(case_num)
+    # col = m.to_rgba(case_num)
     
-    # Get shape points and plot
-    points = np.array(zone.shape.points)
-    scatters.append(
-        go.Scatter(
-            x=points[:,0], 
-            y=points[:,1],
-            line=dict(
-                width=0.1,
-                color="rgb(0,0,0)",
-            ),
-            fill="toself", 
-            fillcolor=f"rgba({','.join([str(x) for x in col])})", 
-            name=f"{ltla_name}\n{case_num:.0f}",
-        )
+    # plt.fill(points[:,0], points[:,1], c=col, linewidth=1)
+    scatters[ltla_code] = go.Scatter(
+        x=list(x), 
+        y=list(y),
+        line=dict(
+            width=0.1,
+            color="rgb(0,0,0)",
+        ),
+        fill="toself", 
+        # fillcolor=get_color_string(col), 
+        name=f"{ltla_name}",
+        hovertext=ltla_code,
     )
+    
 
-# Generate figure
-fig = go.Figure(scatters)
+# Color them based on a day
+def color_date(date):
+    cases_dif = cases_df.diff()[cases_df.index == date]
+    if DIF:
+        vmax = np.abs([cases_dif.min().min(), cases_dif.max().max()]).max()
+        vmin = -vmax
+    else:
+        vmin = 0
+        vmax = cases_df.max().max()
+
+    norm = colors.Normalize(vmin=vmin, vmax=vmax)
+    cmap = cm.coolwarm
+
+    m = cm.ScalarMappable(norm=norm, cmap=cmap)
+    for scatter in fig.select_traces():
+        ltla_code = scatter.hovertext
+        if DIF:
+            case_num = cases_dif[ltla_code]
+        else:
+            case_num = cases_df[ltla_code][date]
+
+        if PER_HUNDRED:
+            case_num = case_num / pop_lookup[ltla_code] * 100_000
+
+        col = m.to_rgba(case_num)
+
+        scatter.fillcolor = get_color_string(col)
+        scatter.name = f"{scatter.name}<br>{case_num.values[0]:.0f} cases"
+
+import time
+start = time.time()
+
+fig = go.Figure(list(scatters.values()))
 fig.update_yaxes(
     scaleanchor="x",
     scaleratio=1,
@@ -151,20 +150,28 @@ fig.update_yaxes(
 fig.update_layout(
     showlegend=False,
 )
-colorbar_trace  = go.Scatter(
-    x=[None],
-    y=[None],
-    mode='markers',
-    marker=dict(
-        colorscale=get_color_strings(m.to_rgba(np.linspace(vmin, vmax, 100))),
-        showscale=True,
-        cmin=-5,
-        cmax=5,
-        colorbar=dict(thickness=5, tickvals=[-5, 5], ticktext=['Low', 'High'], outlinewidth=0)
-    ),
-    hoverinfo='none'
-)
-fig.add_trace(colorbar_trace)
-
 fig.show()
+
+# %%
+# save frames as images
+p = pathlib.Path("images")
+p.mkdir(exist_ok=True)
+
+# Set up dimensions
+scale = 2
+width = 1920//scale//2
+height = 1080//scale
+
+fig_data = {}
+
+progress_bar = tqdm(cases_df.index[1:], desc=f"Generating images {cases_df.index[1].strftime('%Y-%m-%d')}")
+for date in progress_bar:
+    date_str = date.strftime('%Y-%m-%d')
+    filepath = p.joinpath(f"{date_str}.png")
+    # Only render the frame if it doesnt exist
+    if not filepath.exists():
+        progress_bar.set_description(f"Generating images {date_str}")
+        color_date(date)
+        fig.write_image(filepath, width=width, height=height)
+
 print("Done")
